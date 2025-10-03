@@ -1,6 +1,7 @@
 /**:
     ros__parameters:
       video_device: "/dev/video2"
+      usb_port_id: ""
       framerate: 15.0
       io_method: "mmap"
       frame_id: "camera2"

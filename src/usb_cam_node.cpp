@@ -30,7 +30,9 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <map>
 #include <filesystem>
+#include <optional>
 #include "usb_cam/usb_cam_node.hpp"
 #include "usb_cam/utils.hpp"
 
@@ -71,6 +73,9 @@ UsbCamNode::UsbCamNode(const rclcpp::NodeOptions & node_options)
   this->declare_parameter("io_method", "mmap");
   this->declare_parameter("pixel_format", "yuyv");
   this->declare_parameter("av_device_format", "YUV422P");
+  // Optional: select device by USB port id (e.g., "2-2").
+  // When specified, overrides/ignores `video_device`.
+  this->declare_parameter("usb_port_id", "");
   this->declare_parameter("video_device", "/dev/video0");
   this->declare_parameter("brightness", 50);  // 0-255, -1 "leave alone"
   this->declare_parameter("contrast", -1);    // 0-255, -1 "leave alone"
@@ -135,6 +140,157 @@ std::string resolve_device_path(const std::string & path)
     return target_path.string();
   }
   return path;
+}
+
+// Attempt to find a /dev/videoX device corresponding to a given USB port id
+extern "C" {
+#include <linux/videodev2.h>
+#include <fcntl.h>
+}
+
+// Determine if a v4l2 pixel format is color
+static bool is_color_fourcc(uint32_t fourcc)
+{
+  switch (fourcc) {
+    case V4L2_PIX_FMT_YUYV:
+    case V4L2_PIX_FMT_UYVY:
+    case V4L2_PIX_FMT_RGB24:
+    case V4L2_PIX_FMT_MJPEG:
+#ifdef V4L2_PIX_FMT_M420
+    case V4L2_PIX_FMT_M420:
+#endif
+    case V4L2_PIX_FMT_YUV420:
+    case V4L2_PIX_FMT_YUV422P:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static std::optional<uint32_t> preferred_fourcc_from_name(const std::string & name)
+{
+  // Map driver pixel_format names to v4l2 fourcc where possible
+  if (name == "yuyv" || name == "yuyv2rgb") return V4L2_PIX_FMT_YUYV;
+  if (name == "uyvy" || name == "uyvy2rgb") return V4L2_PIX_FMT_UYVY;
+  if (name == "rgb8") return V4L2_PIX_FMT_RGB24;
+  if (name == "mjpeg" || name == "mjpeg2rgb" || name == "raw_mjpeg") return V4L2_PIX_FMT_MJPEG;
+  if (name == "m4202rgb") {
+#ifdef V4L2_PIX_FMT_M420
+    return V4L2_PIX_FMT_M420;
+#else
+    return std::nullopt;
+#endif
+  }
+  // mono formats intentionally omitted
+  return std::nullopt;
+}
+
+static bool device_has_preferred_color_format(const std::string & dev, const std::string & preferred_name)
+{
+  int fd = open(dev.c_str(), O_RDONLY);
+  if (fd == -1) {
+    return false;
+  }
+  auto preferred_fourcc = preferred_fourcc_from_name(preferred_name);
+  if (!preferred_fourcc) {
+    close(fd);
+    return false;
+  }
+
+  struct v4l2_fmtdesc fmt = {};
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  for (fmt.index = 0; usb_cam::utils::xioctl(fd, VIDIOC_ENUM_FMT, &fmt) == 0; ++fmt.index) {
+    if (fmt.pixelformat == preferred_fourcc.value()) { close(fd); return true; }
+  }
+  close(fd);
+  return false;
+}
+
+static bool device_has_any_color_format(const std::string & dev)
+{
+  int fd = open(dev.c_str(), O_RDONLY);
+  if (fd == -1) {
+    return false;
+  }
+  struct v4l2_fmtdesc fmt = {};
+  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+  for (fmt.index = 0; usb_cam::utils::xioctl(fd, VIDIOC_ENUM_FMT, &fmt) == 0; ++fmt.index) {
+    if (is_color_fourcc(fmt.pixelformat)) { close(fd); return true; }
+  }
+  close(fd);
+  return false;
+}
+
+static std::string find_video_device_by_usb_port_id(const std::string & usb_port_id,
+  const std::string & preferred_pixel_format_name)
+{
+  if (usb_port_id.empty()) {
+    return "";
+  }
+
+  const std::string v4l2_symlinks_dir = "/sys/class/video4linux/";
+  std::map<std::string, v4l2_capability> candidates = usb_cam::utils::available_devices();
+
+  // Prefer capture-capable nodes
+  auto is_capture_cap = [](const v4l2_capability & caps) -> bool {
+    return (caps.capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
+           (caps.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE);
+  };
+
+  std::string first_match;
+  std::string first_color_match;
+  for (const auto & entry : std::filesystem::directory_iterator(v4l2_symlinks_dir)) {
+    if (!std::filesystem::is_symlink(entry)) {
+      continue;
+    }
+
+    // Resolve canonical target under /sys/devices
+    auto target = std::filesystem::canonical(
+      v4l2_symlinks_dir + std::filesystem::read_symlink(entry).generic_string());
+
+    const auto target_str = target.generic_string();
+    // Match either "/<id>/" or "/<id>:" patterns in the path
+    const std::string pat1 = std::string("/") + usb_port_id + "/";
+    const std::string pat2 = std::string("/") + usb_port_id + ":";
+    if (target_str.find(pat1) == std::string::npos && target_str.find(pat2) == std::string::npos) {
+      continue;
+    }
+
+    // Parse DEVNAME from uevent to get /dev/videoX
+    std::ifstream uevent_file(target_str + "/uevent");
+    std::string line;
+    std::string devname;
+    while (std::getline(uevent_file, line)) {
+      auto dev_name_index = line.find("DEVNAME=");
+      if (dev_name_index != std::string::npos) {
+        devname = std::string("/dev/") + line.substr(dev_name_index + 8);
+        break;
+      }
+    }
+
+    if (devname.empty()) {
+      continue;
+    }
+
+    auto it = candidates.find(devname);
+    if (it != candidates.end() && is_capture_cap(it->second)) {
+      // Prefer device that supports preferred color format, then any color format
+      if (!preferred_pixel_format_name.empty() &&
+          preferred_fourcc_from_name(preferred_pixel_format_name).has_value() &&
+          device_has_preferred_color_format(devname, preferred_pixel_format_name)) {
+        return devname;
+      }
+      if (first_color_match.empty() && device_has_any_color_format(devname)) {
+        first_color_match = devname;
+      }
+      if (first_match.empty()) {
+        first_match = devname;
+      }
+    }
+  }
+
+  if (!first_color_match.empty()) return first_color_match;
+  return first_match;  // Fallback to any match
 }
 
 void UsbCamNode::init()
@@ -229,7 +385,7 @@ void UsbCamNode::get_params()
   auto parameters = parameters_client->get_parameters(
     {
       "camera_name", "camera_info_url", "frame_id", "framerate", "image_height", "image_width",
-      "io_method", "pixel_format", "av_device_format", "video_device", "brightness", "contrast",
+      "io_method", "pixel_format", "av_device_format", "usb_port_id", "video_device", "brightness", "contrast",
       "saturation", "sharpness", "gain", "auto_white_balance", "white_balance", "autoexposure",
       "exposure", "autofocus", "focus"
     }
@@ -261,8 +417,31 @@ void UsbCamNode::assign_params(const std::vector<rclcpp::Parameter> & parameters
       m_parameters.pixel_format_name = parameter.value_to_string();
     } else if (parameter.get_name() == "av_device_format") {
       m_parameters.av_device_format = parameter.value_to_string();
+    } else if (parameter.get_name() == "usb_port_id") {
+      const auto port_id = parameter.value_to_string();
+      if (!port_id.empty()) {
+        // Prefer current pixel_format if set
+        const auto dev = find_video_device_by_usb_port_id(port_id, m_parameters.pixel_format_name);
+        if (!dev.empty()) {
+          RCLCPP_INFO(this->get_logger(), "usb_port_id '%s' resolved to device '%s'",
+            port_id.c_str(), dev.c_str());
+          m_parameters.device_name = dev;
+        } else {
+          RCLCPP_ERROR(this->get_logger(),
+            "usb_port_id '%s' did not resolve to any V4L2 device", port_id.c_str());
+        }
+      }
     } else if (parameter.get_name() == "video_device") {
-      m_parameters.device_name = resolve_device_path(parameter.value_to_string());
+      // Only apply video_device if usb_port_id is not set in current node parameters
+      // Query current declared value to enforce precedence
+      auto current_port_id = this->get_parameter("usb_port_id").as_string();
+      if (current_port_id.empty()) {
+        m_parameters.device_name = resolve_device_path(parameter.value_to_string());
+      } else {
+        RCLCPP_INFO(this->get_logger(),
+          "Ignoring 'video_device' because 'usb_port_id' is set to '%s'",
+          current_port_id.c_str());
+      }
     } else if (parameter.get_name() == "brightness") {
       m_parameters.brightness = parameter.as_int();
     } else if (parameter.get_name() == "contrast") {
