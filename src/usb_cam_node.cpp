@@ -73,8 +73,6 @@ UsbCamNode::UsbCamNode(const rclcpp::NodeOptions & node_options)
   this->declare_parameter("io_method", "mmap");
   this->declare_parameter("pixel_format", "yuyv");
   this->declare_parameter("av_device_format", "YUV422P");
-  // Optional: select device by USB port id (e.g., "2-2").
-  // When specified, overrides/ignores `video_device`.
   this->declare_parameter("usb_port_id", "");
   this->declare_parameter("video_device", "/dev/video0");
   this->declare_parameter("brightness", 50);  // 0-255, -1 "leave alone"
@@ -432,8 +430,6 @@ void UsbCamNode::assign_params(const std::vector<rclcpp::Parameter> & parameters
         }
       }
     } else if (parameter.get_name() == "video_device") {
-      // Only apply video_device if usb_port_id is not set in current node parameters
-      // Query current declared value to enforce precedence
       auto current_port_id = this->get_parameter("usb_port_id").as_string();
       if (current_port_id.empty()) {
         m_parameters.device_name = resolve_device_path(parameter.value_to_string());
