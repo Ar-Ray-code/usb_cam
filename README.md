@@ -79,6 +79,12 @@ ros2 run usb_cam usb_cam_node_exe --ros-args --params-file /path/to/colcon_ws/sr
 # along with an additional image viewer node
 ros2 launch usb_cam camera.launch.py
 ```
+
+### Selecting the device
+
+- video_device: path to the V4L2 node (e.g., `/dev/video0`).
+- usb_port_id: USB port identifier (e.g., `2-2`). When set, it takes precedence and `video_device` is ignored. The node resolves the matching `/dev/videoX` by scanning `/sys/class/video4linux` and picking a capture-capable device on that USB port.
+
 ## Launching Multiple usb_cam's
 
 To launch multiple nodes at once, simply remap the namespace of each one:
